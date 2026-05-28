@@ -8,9 +8,11 @@ Features:
 * Runs under the x86, x86\_64, arm, and arm64 (aarch64) architectures.
 * Includes fast assembly versions of SHA-256 for Intel CPUs with SSSE3, AVX,
   AVX2, and SHA extensions.
+* Supports vanity prefix generation for both legacy (`1...`) and Taproot
+  (`bc1p...`) Bitcoin addresses.
 
 Limitations:
-* Currently only supports Bitcoin compressed public keys.
+* Uses mainnet address formats only.
 * Does not support combining private keys via addition/multiplication methods.
 
 Example
@@ -23,6 +25,14 @@ Example program execution:
     [5003 Kkey/s][Total 31878804156][Prob 3.5%][50% in 1.4d]
     Private Key:   L3jTmJvNtjNrUw5SJJGFfGTog46fLutsQJ4XG66YWHMV5UmgFWqZ
     Address:       1Vanity8HEFQDR7ZFsAUFeRR67AG38PcR
+
+Taproot example:
+
+    $ vanitygen bc1pvan
+    Difficulty: 32768
+    [5065 Kkey/s][Total 27359149][Prob 100.0%]
+    Private Key:   L4...
+    Address:       bc1pvan...
 
 Build Prerequisites
 -------------------

@@ -87,6 +87,9 @@ static double get_difficulty(void);
 static double get_taproot_difficulty(void);
 static bool taproot_encode_address(char out[TAPROOT_ADDR_MAX],
                                    const u8 pubkey[TAPROOT_PUBKEY_SZ]);
+static bool taproot_tweak_pubkey(const secp256k1_context *sec_ctx,
+                                 const secp256k1_ge *internal,
+                                 u8 tweaked[TAPROOT_PUBKEY_SZ]);
 static bool taproot_match_prefix(const u8 pubkey[TAPROOT_PUBKEY_SZ]);
 static void engine(int thread);
 static bool verify_key(const u8 result[RESULT_SZ]);
@@ -949,6 +952,50 @@ static bool taproot_encode_address(char out[TAPROOT_ADDR_MAX],
   return 1;
 }
 
+static bool taproot_tweak_pubkey(const secp256k1_context *sec_ctx,
+                                 const secp256k1_ge *internal,
+                                 u8 tweaked[TAPROOT_PUBKEY_SZ])
+{
+  static const u8 tap_tweak_tag_hash[32]={
+    0xe8,0x0f,0xe1,0x63,0x9c,0x9c,0xa0,0x50,
+    0xe3,0xaf,0x1b,0x39,0xc1,0x43,0xc6,0x3e,
+    0x42,0x9c,0xbc,0xeb,0x15,0xd9,0x40,0xfb,
+    0xb5,0xc5,0xa1,0xf4,0xaf,0x57,0xc5,0xe9
+  };
+  secp256k1_sha256_t hash;
+  secp256k1_scalar tweak;
+  secp256k1_ge output=*internal;
+  secp256k1_gej tweakj, outputj;
+  align8 u8 tweak32[32], xonly[32];
+  int overflow;
+
+  if(secp256k1_fe_is_odd(&output.y))
+    secp256k1_ge_neg(&output, &output);
+
+  secp256k1_fe_get_b32(xonly, &output.x);
+
+  secp256k1_sha256_initialize(&hash);
+  secp256k1_sha256_write(&hash, tap_tweak_tag_hash, sizeof(tap_tweak_tag_hash));
+  secp256k1_sha256_write(&hash, tap_tweak_tag_hash, sizeof(tap_tweak_tag_hash));
+  secp256k1_sha256_write(&hash, xonly, sizeof(xonly));
+  secp256k1_sha256_finalize(&hash, tweak32);
+
+  secp256k1_scalar_set_b32(&tweak, tweak32, &overflow);
+  if(overflow || secp256k1_scalar_is_zero(&tweak))
+    return 0;
+
+  secp256k1_gej_set_ge(&outputj, &output);
+  secp256k1_ecmult_gen(&sec_ctx->ecmult_gen_ctx, &tweakj, &tweak);
+  secp256k1_gej_add_var(&outputj, &outputj, &tweakj, NULL);
+
+  if(secp256k1_gej_is_infinity(&outputj))
+    return 0;
+
+  secp256k1_ge_set_gej_var(&output, &outputj);
+  secp256k1_fe_get_b32(tweaked, &output.x);
+  return 1;
+}
+
 static bool taproot_match_prefix(const u8 pubkey[TAPROOT_PUBKEY_SZ])
 {
   char addr[TAPROOT_ADDR_MAX];
@@ -986,7 +1033,7 @@ static void engine(int thread)
     memset(result+32+LEGACY_PUBKEY_SZ, 0, TAPROOT_PUBKEY_SZ-LEGACY_PUBKEY_SZ);
 
   /* Initialize the secp256k1 context */
-  sec_ctx=secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+  sec_ctx=secp256k1_context_create(SECP256K1_CONTEXT_SIGN|SECP256K1_CONTEXT_VERIFY);
 
   if(addr_mode == ADDR_MODE_LEGACY) {
     /* Set up sha256 block for an input length of 33 bytes */
@@ -1050,8 +1097,8 @@ static void engine(int thread)
       thread_count[thread]++;
 
       if(addr_mode == ADDR_MODE_TAPROOT) {
-        secp256k1_fe_get_b32(pubkey, &rslt[k].x);
-        if(unlikely(taproot_match_prefix(pubkey))) {
+        if(unlikely(taproot_tweak_pubkey(sec_ctx, &rslt[k], pubkey) &&
+                    taproot_match_prefix(pubkey))) {
           goto found;
         }
       } else {
@@ -1125,7 +1172,7 @@ static bool verify_key(const u8 result[RESULT_SZ])
   }
 
   /* Initialize the secp256k1 context */
-  sec_ctx=secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+  sec_ctx=secp256k1_context_create(SECP256K1_CONTEXT_SIGN|SECP256K1_CONTEXT_VERIFY);
 
   /* Copy private key to secp256k1 scalar format */
   secp256k1_scalar_set_b32(&scalar, result, &overflow);
@@ -1142,8 +1189,8 @@ static bool verify_key(const u8 result[RESULT_SZ])
 
   if(addr_mode == ADDR_MODE_TAPROOT) {
     align8 u8 tapkey[32];
-    secp256k1_fe_get_b32(tapkey, &ge.x);
-    ret=!memcmp(tapkey, result+32, 32);
+    ret=taproot_tweak_pubkey(sec_ctx, &ge, tapkey) &&
+        !memcmp(tapkey, result+32, 32);
   } else {
     /* Extract the 33-byte compressed public key from the group element */
     sha_block[0]=(secp256k1_fe_is_odd(&ge.y) ? 0x03 : 0x02);

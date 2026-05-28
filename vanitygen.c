@@ -30,13 +30,34 @@
 
 #define MY_VERSION "0.3"
 
-/* List of public key byte patterns to match */
+/* Address result format: 32-byte private key + up to 32-byte public key match */
+#define RESULT_SZ 64
+#define LEGACY_PUBKEY_SZ 20
+#define TAPROOT_PUBKEY_SZ 32
+#define TAPROOT_ADDR_MAX 64
+
+enum {
+  ADDR_MODE_NONE,
+  ADDR_MODE_LEGACY,
+  ADDR_MODE_TAPROOT,
+};
+
+/* List of legacy public key byte patterns to match */
 static struct {
   align8 u8 low[20];   // Low limit
   align8 u8 high[20];  // High limit
 } *patterns;
 
 static int num_patterns;
+static int addr_mode;
+
+/* List of taproot address text prefixes to match */
+static struct {
+  u8 len;
+  char prefix[TAPROOT_ADDR_MAX];
+} *tap_patterns;
+
+static int num_tap_patterns;
 
 /* Global command-line settings */
 static int  max_count=1;
@@ -56,12 +77,18 @@ static int sock[2];
 
 /* Static Functions */
 static void manager_loop(int threads);
-static void announce_result(int found, const u8 result[52]);
+static void announce_result(int found, const u8 result[RESULT_SZ]);
+static bool add_search_prefix(const char *prefix);
 static bool add_prefix(const char *prefix);
 static bool add_anycase_prefix(const char *prefix);
+static bool add_taproot_prefix(const char *prefix);
 static double get_difficulty(void);
+static double get_taproot_difficulty(void);
+static bool taproot_encode_address(char out[TAPROOT_ADDR_MAX],
+                                   const u8 pubkey[TAPROOT_PUBKEY_SZ]);
+static bool taproot_match_prefix(const u8 pubkey[TAPROOT_PUBKEY_SZ]);
 static void engine(int thread);
-static bool verify_key(const u8 result[52]);
+static bool verify_key(const u8 result[RESULT_SZ]);
 
 static void my_secp256k1_ge_set_all_gej_var(secp256k1_ge *r,
                                             const secp256k1_gej *a);
@@ -131,7 +158,10 @@ int main(int argc, char *argv[])
                 "  -k        Keep looking for solutions indefinitely\n"
                 "  -q        Be quiet (report solutions in CSV format)\n"
                 "  -t num    Run 'num' threads; default=%d\n"
-                "  -v        Be verbose\n\n",
+                "  -v        Be verbose\n\n"
+                "Prefix types:\n"
+                "  1...      Legacy P2PKH address prefix (Base58)\n"
+                "  bc1p...   Taproot address prefix (Bech32m)\n\n",
                 *argv, max_count, threads);
         fprintf(stderr, "Super Vanitygen v" MY_VERSION "\n");
         return 1;
@@ -143,30 +173,37 @@ int main(int argc, char *argv[])
   /* Auto-detect fastest SHA-256 function to use */
   sha256_register(verbose);
 
-  // Convert specified prefixes into a global list of public key byte patterns.
+  // Convert prefixes into search patterns.
   for(;i < argc;i++)
-    if((!anycase && !add_prefix(argv[i])) ||
-       (anycase && !add_anycase_prefix(argv[i])))
+    if(!add_search_prefix(argv[i]))
       return 1;
-  if(!num_patterns)
+  if(!num_patterns && !num_tap_patterns)
     goto error;
 
   /* List patterns to match */
   if(verbose) {
-    digits=(num_patterns > 999)?4:(num_patterns > 99)?3:(num_patterns > 9)?2:1;
-    for(i=0;i < num_patterns;i++) {
-      printf("P%0*d High limit: ", digits, i+1);
-      for(j=0;j < 20;j++)
-        printf("%02x", patterns[i].high[j]);
-      printf("\nP%0*d Low limit:  ", digits, i+1);
-      for(j=0;j < 20;j++)
-        printf("%02x", patterns[i].low[j]);
-      printf("\n");
+    if(addr_mode == ADDR_MODE_LEGACY) {
+      digits=(num_patterns > 999)?4:(num_patterns > 99)?3:(num_patterns > 9)?2:1;
+      for(i=0;i < num_patterns;i++) {
+        printf("P%0*d High limit: ", digits, i+1);
+        for(j=0;j < 20;j++)
+          printf("%02x", patterns[i].high[j]);
+        printf("\nP%0*d Low limit:  ", digits, i+1);
+        for(j=0;j < 20;j++)
+          printf("%02x", patterns[i].low[j]);
+        printf("\n");
+      }
+    } else {
+      digits=(num_tap_patterns > 999)?4:(num_tap_patterns > 99)?3:
+             (num_tap_patterns > 9)?2:1;
+      for(i=0;i < num_tap_patterns;i++)
+        printf("T%0*d Prefix:      %s\n", digits, i+1, tap_patterns[i].prefix);
     }
     printf("---\n");
   }
 
-  difficulty=get_difficulty();
+  difficulty=(addr_mode == ADDR_MODE_TAPROOT) ?
+             get_taproot_difficulty() : get_difficulty();
   if(difficulty < 1)
     difficulty=1;
   if(!quiet)
@@ -230,7 +267,7 @@ static void manager_loop(int threads)
   fd_set readset;
   struct timeval tv={1, 0};
   char msg[256];
-  u8 result[52];
+  u8 result[RESULT_SZ];
   u64 prev=0, last_result=0, count, avg, count_avg[8];
   int i, j, ret, len, found=0, count_index=0, count_max=0;
   double prob, secs;
@@ -247,8 +284,8 @@ static void manager_loop(int threads)
 
     if(ret) {
       /* Read the (PrivKey,PubKey) tuple from the socket */
-      if((len=read(sock[0], result, 52)) != 52) {
-        /* Datagram read wasn't 52 bytes; ignore message */
+      if((len=read(sock[0], result, RESULT_SZ)) != RESULT_SZ) {
+        /* Datagram read wasn't expected size; ignore message */
         if(len != -1)
           continue;
 
@@ -325,10 +362,13 @@ static void manager_loop(int threads)
   }
 }
 
-static void announce_result(int found, const u8 result[52])
+static void announce_result(int found, const u8 result[RESULT_SZ])
 {
   align8 u8 priv_block[64], pub_block[64], cksum_block[64];
   align8 u8 wif[64], checksum[32];
+  char taproot[TAPROOT_ADDR_MAX];
+  int pubkey_len=(addr_mode == ADDR_MODE_TAPROOT) ?
+                 TAPROOT_PUBKEY_SZ : LEGACY_PUBKEY_SZ;
   int j;
 
   if(!quiet)
@@ -342,7 +382,7 @@ static void announce_result(int found, const u8 result[52])
     printf("\n");
 
     printf("Public match:  ");
-    for(j=0;j < 20;j++)
+    for(j=0;j < pubkey_len;j++)
       printf("%02x", result[j+32]);
     printf("\n");
   }
@@ -369,22 +409,26 @@ static void announce_result(int found, const u8 result[52])
   else
     printf("Private Key:   %s\n", wif);
 
-  /* Convert Public Key to Compressed WIF */
+  if(addr_mode == ADDR_MODE_TAPROOT) {
+    taproot_encode_address(taproot, result+32);
+    if(quiet)
+      printf(",%s\n", taproot);
+    else
+      printf("Address:       %s\n", taproot);
+  } else {
+    /* Convert Public Key Hash160 to legacy Base58 address */
+    sha256_prepare(pub_block, 21);
+    memcpy(pub_block+1, result+32, 20);
+    sha256_hash(cksum_block, pub_block);
+    sha256_hash(checksum, cksum_block);
+    memcpy(pub_block+21, checksum, 4);
 
-  /* Set up sha256 block for hashing the public key; length of 21 bytes */
-  sha256_prepare(pub_block, 21);
-  memcpy(pub_block+1, result+32, 20);
-
-  /* Compute checksum and copy first 4-bytes to end of public key */
-  sha256_hash(cksum_block, pub_block);
-  sha256_hash(checksum, cksum_block);
-  memcpy(pub_block+21, checksum, 4);
-
-  b58enc(wif, pub_block, 25);
-  if(quiet)
-    printf(",%s\n", wif);
-  else
-    printf("Address:       %s\n", wif);
+    b58enc(wif, pub_block, 25);
+    if(quiet)
+      printf(",%s\n", wif);
+    else
+      printf("Address:       %s\n", wif);
+  }
 
   /* Exit after we find 'max_count' solutions */
   if(!keep_going && found >= max_count)
@@ -396,6 +440,38 @@ static void announce_result(int found, const u8 result[52])
 
 
 /**** Pattern Matching *******************************************************/
+
+static bool add_search_prefix(const char *prefix)
+{
+  bool is_taproot;
+
+  if(!strncasecmp(prefix, "bc1p", 4))
+    is_taproot=1;
+  else if(prefix[0] == '1')
+    is_taproot=0;
+  else {
+    fprintf(stderr, "Error: Prefix '%s' must start with '1' or 'bc1p'.\n",
+            prefix);
+    return 0;
+  }
+
+  if(is_taproot) {
+    if(addr_mode == ADDR_MODE_LEGACY) {
+      fprintf(stderr, "Error: Legacy and Taproot prefixes cannot be mixed.\n");
+      return 0;
+    }
+    addr_mode=ADDR_MODE_TAPROOT;
+    return add_taproot_prefix(prefix);
+  }
+
+  if(addr_mode == ADDR_MODE_TAPROOT) {
+    fprintf(stderr, "Error: Legacy and Taproot prefixes cannot be mixed.\n");
+    return 0;
+  }
+  addr_mode=ADDR_MODE_LEGACY;
+
+  return anycase ? add_anycase_prefix(prefix) : add_prefix(prefix);
+}
 
 // Add a low/high pattern range to the patterns[] array, coalescing adjacent or
 // overlapping patterns into one.
@@ -651,6 +727,65 @@ static bool add_anycase_prefix(const char *prefix)
   return 1;
 }
 
+static bool add_taproot_prefix(const char *prefix)
+{
+  static const char bech32_chars[]="qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+  char normalized[TAPROOT_ADDR_MAX];
+  int i, plen=strlen(prefix);
+
+  if(plen < 4 || plen >= TAPROOT_ADDR_MAX) {
+    fprintf(stderr, "Error: Taproot prefix length must be 4-%d chars.\n",
+            TAPROOT_ADDR_MAX-1);
+    return 0;
+  }
+
+  for(i=0;i < plen;i++) {
+    char c=prefix[i];
+    normalized[i]=(c >= 'A' && c <= 'Z') ? (c|32) : c;
+  }
+  normalized[plen]='\0';
+
+  if(strncmp(normalized, "bc1p", 4)) {
+    fprintf(stderr, "Error: Taproot prefix must start with 'bc1p'.\n");
+    return 0;
+  }
+
+  for(i=4;i < plen;i++)
+    if(!strchr(bech32_chars, normalized[i])) {
+      fprintf(stderr, "Error: Taproot prefix '%s' has invalid bech32 chars.\n",
+              prefix);
+      return 0;
+    }
+
+  for(i=0;i < num_tap_patterns;i++) {
+    if(plen >= tap_patterns[i].len &&
+       !strncmp(normalized, tap_patterns[i].prefix, tap_patterns[i].len))
+      return 1;  /* Existing broader prefix already covers this one */
+
+    if(plen < tap_patterns[i].len &&
+       !strncmp(normalized, tap_patterns[i].prefix, plen)) {
+      /* New prefix is broader than existing one; remove old one */
+      memmove(tap_patterns+i, tap_patterns+i+1,
+              (--num_tap_patterns-i)*sizeof(*tap_patterns));
+      i--;
+    }
+  }
+
+  if(!(num_tap_patterns % 32)) {
+    if(!(tap_patterns=realloc(tap_patterns,
+                              (num_tap_patterns+32)*sizeof(*tap_patterns)))) {
+      perror("realloc");
+      exit(1);
+    }
+  }
+
+  tap_patterns[num_tap_patterns].len=plen;
+  strcpy(tap_patterns[num_tap_patterns].prefix, normalized);
+  num_tap_patterns++;
+
+  return 1;
+}
+
 // Calculate the difficulty of finding a match from the pattern list, where
 // difficulty = 1/{valid pattern space}.
 //
@@ -682,6 +817,17 @@ static double get_difficulty()
   freq += total[0] / 4294967296.0;
 
   return 1/freq;
+}
+
+static double get_taproot_difficulty(void)
+{
+  double freq=0;
+  int i;
+
+  for(i=0;i < num_tap_patterns;i++)
+    freq += pow(32.0, -(tap_patterns[i].len-4));
+
+  return (freq > 0) ? 1/freq : 0;
 }
 
 #ifdef __LP64__
@@ -738,6 +884,77 @@ static bool pubkeycmp(void *low, void *high, void *key)
 
 #endif
 
+static u32 bech32_polymod_step(u32 chk)
+{
+  u32 b=chk >> 25;
+
+  chk=((chk & 0x1ffffff) << 5);
+  if(b & 1) chk ^= 0x3b6a57b2;
+  if(b & 2) chk ^= 0x26508e6d;
+  if(b & 4) chk ^= 0x1ea119fa;
+  if(b & 8) chk ^= 0x3d4233dd;
+  if(b & 16) chk ^= 0x2a1462b3;
+  return chk;
+}
+
+static bool taproot_encode_address(char out[TAPROOT_ADDR_MAX],
+                                   const u8 pubkey[TAPROOT_PUBKEY_SZ])
+{
+  static const char charset[]="qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+  static const char hrp[]="bc";
+  u8 data[1 + ((TAPROOT_PUBKEY_SZ*8+4)/5)];
+  u32 chk=1;
+  int i, outlen=0, bits=0, data_len=1;
+  u32 acc=0;
+
+  data[0]=1;  /* Witness version 1 */
+  for(i=0;i < TAPROOT_PUBKEY_SZ;i++) {
+    acc=(acc << 8) | pubkey[i];
+    bits += 8;
+    while(bits >= 5) {
+      bits -= 5;
+      data[data_len++]=(acc >> bits) & 31;
+    }
+  }
+  if(bits)
+    data[data_len++]=(acc << (5-bits)) & 31;
+
+  for(i=0;hrp[i];i++)
+    chk=bech32_polymod_step(chk) ^ (hrp[i] >> 5);
+  chk=bech32_polymod_step(chk);
+  for(i=0;hrp[i];i++)
+    chk=bech32_polymod_step(chk) ^ (hrp[i] & 31);
+  for(i=0;i < data_len;i++)
+    chk=bech32_polymod_step(chk) ^ data[i];
+  for(i=0;i < 6;i++)
+    chk=bech32_polymod_step(chk);
+  chk ^= 0x2bc830a3;  /* Bech32m constant */
+
+  out[outlen++]='b';
+  out[outlen++]='c';
+  out[outlen++]='1';
+  for(i=0;i < data_len;i++)
+    out[outlen++]=charset[data[i]];
+  for(i=0;i < 6;i++)
+    out[outlen++]=charset[(chk >> (5*(5-i))) & 31];
+  out[outlen]='\0';
+
+  return 1;
+}
+
+static bool taproot_match_prefix(const u8 pubkey[TAPROOT_PUBKEY_SZ])
+{
+  char addr[TAPROOT_ADDR_MAX];
+  int i;
+
+  taproot_encode_address(addr, pubkey);
+  for(i=0;i < num_tap_patterns;i++)
+    if(!strncmp(addr, tap_patterns[i].prefix, tap_patterns[i].len))
+      return 1;
+
+  return 0;
+}
+
 
 /**** Hash Engine ************************************************************/
 
@@ -752,7 +969,7 @@ static void engine(int thread)
   secp256k1_gej temp;
   secp256k1_ge offset;
 
-  align8 u8 sha_block[64], rmd_block[64], result[52], *pubkey=result+32;
+  align8 u8 sha_block[64], rmd_block[64], result[RESULT_SZ], *pubkey=result+32;
   u64 privkey[4], *key=(u64 *)result;
   int i, k, fd, len;
 
@@ -762,11 +979,13 @@ static void engine(int thread)
   /* Initialize the secp256k1 context */
   sec_ctx=secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
 
-  /* Set up sha256 block for an input length of 33 bytes */
-  sha256_prepare(sha_block, 33);
+  if(addr_mode == ADDR_MODE_LEGACY) {
+    /* Set up sha256 block for an input length of 33 bytes */
+    sha256_prepare(sha_block, 33);
 
-  /* Set up rmd160 block for an input length of 32 bytes */
-  rmd160_prepare(rmd_block, 32);
+    /* Set up rmd160 block for an input length of 32 bytes */
+    rmd160_prepare(rmd_block, 32);
+  }
 
   rekey:
 
@@ -821,40 +1040,52 @@ static void engine(int thread)
     for(k=0;k < STEP;k++) {
       thread_count[thread]++;
 
-      /* Extract the 33-byte compressed public key from the group element */
-      sha_block[0]=(secp256k1_fe_is_odd(&rslt[k].y) ? 0x03 : 0x02);
-      secp256k1_fe_get_b32(sha_block+1, &rslt[k].x);
+      if(addr_mode == ADDR_MODE_TAPROOT) {
+        secp256k1_fe_get_b32(pubkey, &rslt[k].x);
+        if(unlikely(taproot_match_prefix(pubkey))) {
+          goto found;
+        }
+      } else {
+        /* Extract the 33-byte compressed public key from the group element */
+        sha_block[0]=(secp256k1_fe_is_odd(&rslt[k].y) ? 0x03 : 0x02);
+        secp256k1_fe_get_b32(sha_block+1, &rslt[k].x);
 
-      /* Hash public key */
-      sha256_hash(rmd_block, sha_block);
-      rmd160_hash(pubkey, rmd_block);
+        /* Hash public key */
+        sha256_hash(rmd_block, sha_block);
+        rmd160_hash(pubkey, rmd_block);
 
-      /* Compare hashed public key with byte patterns */
-      for(i=0;i < num_patterns;i++) {
-        if(unlikely(pubkeycmp(patterns[i].low, patterns[i].high, pubkey))) {
-          /* key := privkey+k+1 */
-          key[0]=privkey[0];
-          key[1]=privkey[1];
-          key[2]=privkey[2];
-          if((key[3]=privkey[3]+k+1) < privkey[3])
-            if(!++key[2])
-              if(!++key[1])
-                ++key[0];
-
-          /* Convert key to big-endian byte format */
-          key[0]=be64(key[0]);
-          key[1]=be64(key[1]);
-          key[2]=be64(key[2]);
-          key[3]=be64(key[3]);
-
-          /* Announce (PrivKey,PubKey) result */
-          if(write(sock[1], result, 52) != 52)
-            return;
-
-          /* Pick a new random starting private key */
-          goto rekey;
+        /* Compare hashed public key with byte patterns */
+        for(i=0;i < num_patterns;i++) {
+          if(unlikely(pubkeycmp(patterns[i].low, patterns[i].high, pubkey))) {
+            memset(result+32+LEGACY_PUBKEY_SZ, 0, TAPROOT_PUBKEY_SZ-LEGACY_PUBKEY_SZ);
+            goto found;
+          }
         }
       }
+      continue;
+
+      found:
+      /* key := privkey+k+1 */
+      key[0]=privkey[0];
+      key[1]=privkey[1];
+      key[2]=privkey[2];
+      if((key[3]=privkey[3]+k+1) < privkey[3])
+        if(!++key[2])
+          if(!++key[1])
+            ++key[0];
+
+      /* Convert key to big-endian byte format */
+      key[0]=be64(key[0]);
+      key[1]=be64(key[1]);
+      key[2]=be64(key[2]);
+      key[3]=be64(key[3]);
+
+      /* Announce (PrivKey,PubKey) result */
+      if(write(sock[1], result, RESULT_SZ) != RESULT_SZ)
+        return;
+
+      /* Pick a new random starting private key */
+      goto rekey;
     }
 
     /* Increment privkey by STEP */
@@ -868,20 +1099,23 @@ static void engine(int thread)
 // Returns 1 if the private key (first 32 bytes of 'result') correctly produces
 // the public key (last 20 bytes of 'result').
 //
-static bool verify_key(const u8 result[52])
+static bool verify_key(const u8 result[RESULT_SZ])
 {
   secp256k1_context *sec_ctx;
   secp256k1_scalar scalar;
   secp256k1_gej gej;
   secp256k1_ge ge;
   align8 u8 sha_block[64], rmd_block[64], pubkey[20];
+  align8 u8 tapkey[32];
   int ret, overflow;
 
-  /* Set up sha256 block for an input length of 33 bytes */
-  sha256_prepare(sha_block, 33);
+  if(addr_mode == ADDR_MODE_LEGACY) {
+    /* Set up sha256 block for an input length of 33 bytes */
+    sha256_prepare(sha_block, 33);
 
-  /* Set up rmd160 block for an input length of 32 bytes */
-  rmd160_prepare(rmd_block, 32);
+    /* Set up rmd160 block for an input length of 32 bytes */
+    rmd160_prepare(rmd_block, 32);
+  }
 
   /* Initialize the secp256k1 context */
   sec_ctx=secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
@@ -899,16 +1133,21 @@ static bool verify_key(const u8 result[52])
   /* Convert to affine coordinates */
   secp256k1_ge_set_gej_var(&ge, &gej);
 
-  /* Extract the 33-byte compressed public key from the group element */
-  sha_block[0]=(secp256k1_fe_is_odd(&ge.y) ? 0x03 : 0x02);
-  secp256k1_fe_get_b32(sha_block+1, &ge.x);
+  if(addr_mode == ADDR_MODE_TAPROOT) {
+    secp256k1_fe_get_b32(tapkey, &ge.x);
+    ret=!memcmp(tapkey, result+32, 32);
+  } else {
+    /* Extract the 33-byte compressed public key from the group element */
+    sha_block[0]=(secp256k1_fe_is_odd(&ge.y) ? 0x03 : 0x02);
+    secp256k1_fe_get_b32(sha_block+1, &ge.x);
 
-  /* Hash public key */
-  sha256_hash(rmd_block, sha_block);
-  rmd160_hash(pubkey, rmd_block);
+    /* Hash public key */
+    sha256_hash(rmd_block, sha_block);
+    rmd160_hash(pubkey, rmd_block);
 
-  /* Verify that the hashed public key matches the result */
-  ret=!memcmp(pubkey, result+32, 20);
+    /* Verify that the hashed public key matches the result */
+    ret=!memcmp(pubkey, result+32, 20);
+  }
 
   secp256k1_context_destroy(sec_ctx);
   return ret;

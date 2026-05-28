@@ -35,6 +35,9 @@
 #define LEGACY_PUBKEY_SZ 20
 #define TAPROOT_PUBKEY_SZ 32
 #define TAPROOT_ADDR_MAX 64
+#define TAPROOT_DATA_LEN (1 + ((TAPROOT_PUBKEY_SZ*8+4)/5))
+#define TAPROOT_DATA_PREFIX_MAX (TAPROOT_DATA_LEN-1)
+#define TAPROOT_PREFIX_NO_CHECKSUM_MAX (3 + TAPROOT_DATA_LEN)
 #define TAP_PATTERN_ALLOC_CHUNK 32
 
 enum {
@@ -55,7 +58,11 @@ static int addr_mode;
 /* List of taproot address text prefixes to match */
 static struct {
   u8 len;
+  u8 data_len;
+  u8 checksum_len;
   char prefix[TAPROOT_ADDR_MAX];
+  u8 data[TAPROOT_DATA_PREFIX_MAX];
+  u8 checksum[6];
 } *tap_patterns;
 
 static int num_tap_patterns;
@@ -735,7 +742,7 @@ static bool add_taproot_prefix(const char *prefix)
 {
   static const char bech32_chars[]="qpzry9x8gf2tvdw0s3jn54khce6mua7l";
   char normalized[TAPROOT_ADDR_MAX];
-  int i, plen=strlen(prefix);
+  int i, j, plen=strlen(prefix);
 
   if(plen < 4 || plen >= TAPROOT_ADDR_MAX) {
     fprintf(stderr, "Error: Taproot prefix length must be 4-%d chars.\n",
@@ -787,6 +794,21 @@ static bool add_taproot_prefix(const char *prefix)
 
   tap_patterns[num_tap_patterns].len=plen;
   strcpy(tap_patterns[num_tap_patterns].prefix, normalized);
+  tap_patterns[num_tap_patterns].data_len=0;
+  tap_patterns[num_tap_patterns].checksum_len=0;
+
+  for(j=4;j < plen && j < TAPROOT_PREFIX_NO_CHECKSUM_MAX;j++) {
+    char *p=strchr(bech32_chars, normalized[j]);
+    tap_patterns[num_tap_patterns].data[tap_patterns[num_tap_patterns].data_len++]=
+      p-bech32_chars;
+  }
+
+  for(;j < plen && tap_patterns[num_tap_patterns].checksum_len < 6;j++) {
+    char *p=strchr(bech32_chars, normalized[j]);
+    tap_patterns[num_tap_patterns]
+      .checksum[tap_patterns[num_tap_patterns].checksum_len++]=p-bech32_chars;
+  }
+
   num_tap_patterns++;
 
   return 1;
@@ -962,6 +984,8 @@ static bool taproot_tweak_pubkey(const secp256k1_context *sec_ctx,
     0x42,0x9c,0xbc,0xeb,0x15,0xd9,0x40,0xfb,
     0xb5,0xc5,0xa1,0xf4,0xaf,0x57,0xc5,0xe9
   };
+  static secp256k1_sha256_t tap_tweak_midstate;
+  static bool tap_tweak_midstate_ready;
   secp256k1_sha256_t hash;
   secp256k1_scalar tweak;
   secp256k1_ge output=*internal;
@@ -974,9 +998,15 @@ static bool taproot_tweak_pubkey(const secp256k1_context *sec_ctx,
 
   secp256k1_fe_get_b32(xonly, &output.x);
 
-  secp256k1_sha256_initialize(&hash);
-  secp256k1_sha256_write(&hash, tap_tweak_tag_hash, sizeof(tap_tweak_tag_hash));
-  secp256k1_sha256_write(&hash, tap_tweak_tag_hash, sizeof(tap_tweak_tag_hash));
+  if(unlikely(!tap_tweak_midstate_ready)) {
+    secp256k1_sha256_initialize(&tap_tweak_midstate);
+    secp256k1_sha256_write(&tap_tweak_midstate, tap_tweak_tag_hash,
+                           sizeof(tap_tweak_tag_hash));
+    secp256k1_sha256_write(&tap_tweak_midstate, tap_tweak_tag_hash,
+                           sizeof(tap_tweak_tag_hash));
+    tap_tweak_midstate_ready=1;
+  }
+  hash=tap_tweak_midstate;
   secp256k1_sha256_write(&hash, xonly, sizeof(xonly));
   secp256k1_sha256_finalize(&hash, tweak32);
 
@@ -998,13 +1028,55 @@ static bool taproot_tweak_pubkey(const secp256k1_context *sec_ctx,
 
 static bool taproot_match_prefix(const u8 pubkey[TAPROOT_PUBKEY_SZ])
 {
-  char addr[TAPROOT_ADDR_MAX];
-  int i;
+  static const char hrp[]="bc";
+  u8 data[TAPROOT_DATA_LEN], checksum[6];
+  int i, bits=0, data_len=1;
+  bool checksum_ready=0;
+  u32 acc=0, chk;
 
-  taproot_encode_address(addr, pubkey);
-  for(i=0;i < num_tap_patterns;i++)
-    if(!strncmp(addr, tap_patterns[i].prefix, tap_patterns[i].len))
-      return 1;
+  data[0]=1;  /* Witness version 1 */
+  for(i=0;i < TAPROOT_PUBKEY_SZ;i++) {
+    acc=(acc << 8) | pubkey[i];
+    bits += 8;
+    while(bits >= 5) {
+      bits -= 5;
+      data[data_len++]=(acc >> bits) & 31;
+    }
+  }
+  if(bits)
+    data[data_len++]=(acc << (5-bits)) & 31;
+
+  for(i=0;i < num_tap_patterns;i++) {
+    if(tap_patterns[i].data_len &&
+       memcmp(data+1, tap_patterns[i].data, tap_patterns[i].data_len))
+      continue;
+
+    if(tap_patterns[i].checksum_len) {
+      int j;
+
+      if(!checksum_ready) {
+        checksum_ready=1;
+        chk=1;
+        for(j=0;hrp[j];j++)
+          chk=bech32_polymod_step(chk) ^ (hrp[j] >> 5);
+        chk=bech32_polymod_step(chk);
+        for(j=0;hrp[j];j++)
+          chk=bech32_polymod_step(chk) ^ (hrp[j] & 31);
+        for(j=0;j < data_len;j++)
+          chk=bech32_polymod_step(chk) ^ data[j];
+        for(j=0;j < 6;j++)
+          chk=bech32_polymod_step(chk);
+        chk ^= 0x2bc830a3;  /* Bech32m constant */
+        for(j=0;j < 6;j++)
+          checksum[j]=(chk >> (5*(5-j))) & 31;
+      }
+
+      if(memcmp(checksum, tap_patterns[i].checksum, tap_patterns[i].checksum_len))
+        continue;
+    }
+
+    return 1;
+  }
 
   return 0;
 }

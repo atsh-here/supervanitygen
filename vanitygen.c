@@ -965,10 +965,14 @@ static bool taproot_tweak_pubkey(const secp256k1_context *sec_ctx,
   secp256k1_sha256_t hash;
   secp256k1_scalar tweak;
   secp256k1_ge output=*internal;
+  secp256k1_gej tweakj, outputj;
   align8 u8 tweak32[32], xonly[32];
   int overflow;
 
-  secp256k1_fe_get_b32(xonly, &internal->x);
+  if(secp256k1_fe_is_odd(&output.y))
+    secp256k1_ge_neg(&output, &output);
+
+  secp256k1_fe_get_b32(xonly, &output.x);
 
   secp256k1_sha256_initialize(&hash);
   secp256k1_sha256_write(&hash, tap_tweak_tag_hash, sizeof(tap_tweak_tag_hash));
@@ -980,9 +984,14 @@ static bool taproot_tweak_pubkey(const secp256k1_context *sec_ctx,
   if(overflow || secp256k1_scalar_is_zero(&tweak))
     return 0;
 
-  if(!secp256k1_eckey_pubkey_tweak_add(&sec_ctx->ecmult_ctx, &output, &tweak))
+  secp256k1_gej_set_ge(&outputj, &output);
+  secp256k1_ecmult_gen(&sec_ctx->ecmult_gen_ctx, &tweakj, &tweak);
+  secp256k1_gej_add_var(&outputj, &outputj, &tweakj, NULL);
+
+  if(secp256k1_gej_is_infinity(&outputj))
     return 0;
 
+  secp256k1_ge_set_gej_var(&output, &outputj);
   secp256k1_fe_get_b32(tweaked, &output.x);
   return 1;
 }

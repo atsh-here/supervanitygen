@@ -35,6 +35,7 @@
 #define LEGACY_PUBKEY_SZ 20
 #define TAPROOT_PUBKEY_SZ 32
 #define TAPROOT_ADDR_MAX 64
+#define TAP_PATTERN_ALLOC_CHUNK 32
 
 enum {
   ADDR_MODE_NONE,
@@ -446,9 +447,9 @@ static bool add_search_prefix(const char *prefix)
   bool is_taproot;
 
   if(!strncasecmp(prefix, "bc1p", 4))
-    is_taproot=1;
+    is_taproot=(bool)1;
   else if(prefix[0] == '1')
-    is_taproot=0;
+    is_taproot=(bool)0;
   else {
     fprintf(stderr, "Error: Prefix '%s' must start with '1' or 'bc1p'.\n",
             prefix);
@@ -766,14 +767,16 @@ static bool add_taproot_prefix(const char *prefix)
        !strncmp(normalized, tap_patterns[i].prefix, plen)) {
       /* New prefix is broader than existing one; remove old one */
       memmove(tap_patterns+i, tap_patterns+i+1,
-              (--num_tap_patterns-i)*sizeof(*tap_patterns));
+              (num_tap_patterns-i-1)*sizeof(*tap_patterns));
+      num_tap_patterns--;
       i--;
     }
   }
 
-  if(!(num_tap_patterns % 32)) {
+  if(!(num_tap_patterns % TAP_PATTERN_ALLOC_CHUNK)) {
     if(!(tap_patterns=realloc(tap_patterns,
-                              (num_tap_patterns+32)*sizeof(*tap_patterns)))) {
+                              (num_tap_patterns+TAP_PATTERN_ALLOC_CHUNK)*
+                              sizeof(*tap_patterns)))) {
       perror("realloc");
       exit(1);
     }
@@ -822,10 +825,14 @@ static double get_difficulty()
 static double get_taproot_difficulty(void)
 {
   double freq=0;
-  int i;
+  int i, j;
 
-  for(i=0;i < num_tap_patterns;i++)
-    freq += pow(32.0, -(tap_patterns[i].len-4));
+  for(i=0;i < num_tap_patterns;i++) {
+    double p=1;
+    for(j=4;j < tap_patterns[i].len;j++)
+      p *= 0.03125;  /* 1/32 per bech32 character */
+    freq += p;
+  }
 
   return (freq > 0) ? 1/freq : 0;
 }
@@ -975,6 +982,8 @@ static void engine(int thread)
 
   /* Set CPU affinity for this thread# (ignore any failures) */
   set_working_cpu(thread);
+  if(addr_mode == ADDR_MODE_LEGACY)
+    memset(result+32+LEGACY_PUBKEY_SZ, 0, TAPROOT_PUBKEY_SZ-LEGACY_PUBKEY_SZ);
 
   /* Initialize the secp256k1 context */
   sec_ctx=secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
@@ -1057,7 +1066,6 @@ static void engine(int thread)
         /* Compare hashed public key with byte patterns */
         for(i=0;i < num_patterns;i++) {
           if(unlikely(pubkeycmp(patterns[i].low, patterns[i].high, pubkey))) {
-            memset(result+32+LEGACY_PUBKEY_SZ, 0, TAPROOT_PUBKEY_SZ-LEGACY_PUBKEY_SZ);
             goto found;
           }
         }
@@ -1106,7 +1114,6 @@ static bool verify_key(const u8 result[RESULT_SZ])
   secp256k1_gej gej;
   secp256k1_ge ge;
   align8 u8 sha_block[64], rmd_block[64], pubkey[20];
-  align8 u8 tapkey[32];
   int ret, overflow;
 
   if(addr_mode == ADDR_MODE_LEGACY) {
@@ -1134,6 +1141,7 @@ static bool verify_key(const u8 result[RESULT_SZ])
   secp256k1_ge_set_gej_var(&ge, &gej);
 
   if(addr_mode == ADDR_MODE_TAPROOT) {
+    align8 u8 tapkey[32];
     secp256k1_fe_get_b32(tapkey, &ge.x);
     ret=!memcmp(tapkey, result+32, 32);
   } else {
